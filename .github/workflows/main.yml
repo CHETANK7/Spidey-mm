@@ -1,0 +1,539 @@
+import asyncio
+import os
+import re
+from telethon import TelegramClient, events, functions, types
+
+# Try importing Pillow for image reading if available
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+# =========================
+# YOUR DETAILS
+# =========================
+API_ID = 35166931
+API_HASH = "3e834f4394b8f41d51d08c7ed3414488"
+OWNER_ID = 8363677671
+
+GROUP_NAME = "SPIDEY MM"
+GROUP_ABOUT = " @ocyzo SPIDEY MM GC "
+PROFILE_PIC_PATH = "/sdcard/Pictures/Screenshots/Screenshot_20260827_001123.jpg"
+
+BOT_USERNAME = "ocyzomm_bot"
+# Replace this with your actual bot token from @BotFather
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+
+# User client for creating groups and managing admin rights
+client = TelegramClient("mm_user_session", API_ID, API_HASH)
+
+# Bot client initialized using TelegramClient with bot_token
+bot_client = TelegramClient("mm_bot_session", API_ID, API_HASH)
+
+# Dictionaries to store latest extracted deal info for each group ID
+group_deal_amounts = {}
+
+
+def is_owner(event):
+    return event.out and event.sender_id == OWNER_ID
+
+
+# /mm = create group from DM/anywhere, add bot, set admin, set profile pic, and post terms via BOT
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/mm$"))
+async def create_group(event):
+    if not is_owner(event):
+        return
+
+    status = await event.respond("⏳ Creating new group and setting up bot...")
+
+    try:
+        # Create a new supergroup with description
+        result = await client(
+            functions.channels.CreateChannelRequest(
+                title=GROUP_NAME,
+                about=GROUP_ABOUT,
+                broadcast=False,
+                megagroup=True
+            )
+        )
+
+        group = result.chats[0]
+        group_id = group.id
+
+        # Enable join requests approval
+        try:
+            await client(
+                functions.messages.ToggleChatJoinRequestRequest(
+                    peer=group,
+                    enabled=True
+                )
+            )
+        except Exception:
+            pass
+
+        # Add the bot to the newly created group and promote it
+        try:
+            bot_entity = await client.get_entity(BOT_USERNAME)
+
+            await client(
+                functions.channels.InviteToChannelRequest(
+                    channel=group,
+                    users=[bot_entity]
+                )
+            )
+            
+            # Promote the bot to Administrator with full rights
+            admin_rights = types.ChatAdminRights(
+                change_info=True,
+                post_messages=True,
+                edit_messages=True,
+                delete_messages=True,
+                ban_users=True,
+                invite_users=True,
+                pin_messages=True,
+                add_admins=True,
+                manage_call=True,
+                anonymous=False
+            )
+            await client(
+                functions.channels.EditAdminRequest(
+                    channel=group,
+                    user_id=bot_entity,
+                    admin_rights=admin_rights,
+                    rank="MM Bot"
+                )
+            )
+        except Exception as bot_err:
+            print(f"Failed to add or promote bot: {bot_err}")
+
+        # Set profile picture if the image file exists at the specified path
+        if os.path.exists(PROFILE_PIC_PATH):
+            try:
+                uploaded_file = await client.upload_file(PROFILE_PIC_PATH)
+                await client(
+                    functions.channels.EditPhotoRequest(
+                        channel=group,
+                        photo=uploaded_file
+                    )
+                )
+            except Exception as photo_err:
+                print(f"Failed to set profile picture: {photo_err}")
+        else:
+            print(f"Profile picture not found at: {PROFILE_PIC_PATH}")
+
+        # Export chat invite link
+        invite = await client(
+            functions.messages.ExportChatInviteRequest(
+                peer=group
+            )
+        )
+
+        # Updated text for /mm response with GC link in bold text font
+        await status.edit(
+            "**🥂 Thank you for choosing @ocyzo MM!\n\n"
+            "👇 Please join the GC and share the link with your dealer.\n\n"
+            "📌 Keep all deal-related communication inside the GC for a smooth and secure deal.\n\n"
+            f"{invite.link}**",
+            parse_mode='markdown'
+        )
+
+        # Terms message sent natively by the bot client
+        terms_text = (
+            "**Hey. Please state the terms of the deal.\n\n"
+            "- What is the deal?\n"
+            "- Who is the buyer/seller?\n"
+            "- What is the agreed price and which crypto?\n"
+            "- Include any other relevant information.\n\n"
+            "• i am not dealing below 50rs ~ @ocyzo**"
+        )
+        
+        await bot_client.send_message(group_id, terms_text, parse_mode='markdown')
+
+    except Exception as e:
+        await status.edit(
+            "❌ Could not create the group.\n"
+            f"{type(e).__name__}: {e}"
+        )
+
+
+# /delete = delete/destroy the group automatically
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/delete$"))
+async def delete_group(event):
+    if not is_owner(event):
+        return
+
+    if not event.is_group:
+        await event.respond("❌ Use /delete inside a group to delete it.")
+        return
+
+    try:
+        await event.respond("🗑️ Deleting group...")
+        await client(
+            functions.channels.DeleteChannelRequest(
+                channel=await event.get_input_chat()
+            )
+        )
+    except Exception as e:
+        await event.respond(
+            f"❌ Delete failed: {type(e).__name__}: {e}"
+        )
+
+
+# Capture text messages from group members for deal terms/amounts
+@client.on(events.NewMessage(incoming=True))
+async def capture_deal_terms(event):
+    if not event.is_group:
+        return
+    
+    text = event.raw_text
+    match = re.search(r"(?:₹|rs\.?|inr)\s*(\d+)", text, re.IGNORECASE)
+    if not match:
+        match = re.search(r"(\d+)\s*(?:₹|rs|inr)?", text, re.IGNORECASE)
+        
+    if match:
+        amount = match.group(1)
+        group_deal_amounts[event.chat_id] = amount
+
+
+# Automatically detect payment screenshots sent by members
+@client.on(events.NewMessage(incoming=True))
+async def capture_payment_screenshot(event):
+    if not event.is_group or not event.photo:
+        return
+
+    try:
+        path = await event.download_media()
+        extracted_text = ""
+
+        if OCR_AVAILABLE:
+            try:
+                img = Image.open(path)
+                extracted_text = pytesseract.image_to_string(img)
+            except Exception:
+                pass
+        
+        if os.path.exists(path):
+            os.remove(path)
+
+        full_context = f"{event.raw_text or ''}\n{extracted_text}"
+
+        amt_match = re.search(r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d{2})?)", full_context, re.IGNORECASE)
+        if not amt_match:
+            amt_match = re.search(r"([\d,]+\.\d{2})\s*(?:₹|rs|inr)?", full_context, re.IGNORECASE)
+
+        if amt_match:
+            raw_amt = amt_match.group(1).replace(",", "")
+            group_deal_amounts[event.chat_id] = raw_amt
+
+    except Exception as e:
+        print(f"Error parsing payment screenshot: {e}")
+
+
+# /qr = calculate amount + ₹10 fee and show UPI text via BOT
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/qr$"))
+async def qr_command(event):
+    if not is_owner(event):
+        return
+    
+    if not event.is_group:
+        await event.respond("❌ Use /qr inside a deal group.")
+        return
+
+    chat_id = event.chat_id
+    amount_str = group_deal_amounts.get(chat_id)
+
+    await event.delete()
+
+    if amount_str is None:
+        await bot_client.send_message(chat_id, "⚠️ No deal amount detected yet. Make sure the users have filled and sent the terms with the price first!")
+        return
+
+    try:
+        amount = int(float(amount_str))
+    except ValueError:
+        amount = 0
+
+    fee = 10
+    total = amount + fee
+
+    qr_text = (
+        f"**Pay ₹{amount} + Fee: ₹{fee} = ₹{total} INR**\n\n"
+        "**To UPI:** `chetanxowns@fam`"
+    )
+
+    await bot_client.send_message(chat_id, qr_text, parse_mode='markdown')
+
+
+# /recived = send payment received confirmation message via BOT
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/recived$"))
+async def payment_received(event):
+    if not is_owner(event):
+        return
+    
+    if not event.is_group:
+        await event.respond("❌ Use /recived inside a deal group.")
+        return
+
+    await event.delete()
+    
+    chat_id = event.chat_id
+    amount = group_deal_amounts.get(chat_id, "0")
+
+    await bot_client.send_message(
+        chat_id,
+        f"**✅ Payment Received\n\n"
+        f"Amount: ₹{amount}\n\n"
+        f"✅ DEAL LOGGED SUCCESSFULLY!\n\n"
+        f"YOU CAN START THE DEAL**",
+        parse_mode='markdown'
+    )
+
+
+# /relese = release funds to tagged user profile via BOT
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/relese$"))
+async def release_funds(event):
+    if not is_owner(event):
+        return
+    
+    if not event.is_group:
+        await event.respond("❌ Use /relese inside a deal group.")
+        return
+
+    await event.delete()
+
+    reply = await event.get_reply_message()
+    if not reply:
+        await event.respond("⚠️ Please reply/slide to the user's message when using /relese to release funds to them.")
+        return
+
+    sender = await reply.get_sender()
+    if not sender:
+        await event.respond("❌ Could not identify the user from the replied message.")
+        return
+
+    user_id = sender.id
+    first_name = getattr(sender, 'first_name', 'User')
+    username = getattr(sender, 'username', None)
+
+    if username:
+        user_mention = f"[@{username}](https://t.me/{username})"
+    else:
+        user_mention = f"[{first_name}](tg://user?id={user_id})"
+
+    await bot_client.send_message(
+        event.chat_id,
+        f"**Funds Released successfully 🤝\n\n"
+        f"Funds have been sent to your QR code ({user_mention}) ✅\n\n"
+        f"MM Service Complete ✅**",
+        parse_mode='markdown',
+        link_preview=False
+    )
+
+
+# /refund = refund payment to tagged user and close deal via BOT
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/refund$"))
+async def refund_command(event):
+    if not is_owner(event):
+        return
+    
+    if not event.is_group:
+        await event.respond("❌ Use /refund inside a deal group.")
+        return
+
+    await event.delete()
+
+    reply = await event.get_reply_message()
+    if not reply:
+        await event.respond("⚠️ Please reply/slide to the user's message when using /refund.")
+        return
+
+    sender = await reply.get_sender()
+    if not sender:
+        await event.respond("❌ Could not identify the user from the replied message.")
+        return
+
+    user_id = sender.id
+    first_name = getattr(sender, 'first_name', 'User')
+    username = getattr(sender, 'username', None)
+
+    if username:
+        user_mention = f"[@{username}](https://t.me/{username})"
+    else:
+        user_mention = f"[{first_name}](tg://user?id={user_id})"
+
+    chat_id = event.chat_id
+    amount = group_deal_amounts.get(chat_id, "0")
+
+    refund_text = (
+        f"**• Payment refunded to {user_mention} successfully ✅\n\n"
+        f"• Refund amount :- ₹{amount}\n\n"
+        f"• Thanx for choosing @ocyzo As MM\n\n"
+        f"This deal is closed 🔐 now !!**"
+    )
+
+    await bot_client.send_message(
+        chat_id, 
+        refund_text, 
+        parse_mode='markdown',
+        link_preview=False
+    )
+
+
+# /lock = lock group with custom bold text via BOT
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/lock$"))
+async def lock_group(event):
+    if not is_owner(event):
+        return
+
+    if not event.is_group:
+        await event.respond("❌ Use /lock inside a group.")
+        return
+
+    await event.delete()
+
+    try:
+        rights = types.ChatBannedRights(
+            until_date=None,
+            send_messages=True,
+            send_media=True,
+            send_stickers=True,
+            send_gifs=True,
+            send_games=True,
+            send_inline=True,
+            embed_links=True,
+            send_polls=True,
+            change_info=True,
+            invite_users=True,
+            pin_messages=True,
+            send_photos=True,
+            send_videos=True,
+            send_roundvideos=True,
+            send_audios=True,
+            send_docs=True,
+            send_voices=True,
+            send_plain=True
+        )
+
+        await client(
+            functions.messages.EditChatDefaultBannedRightsRequest(
+                peer=await event.get_input_chat(),
+                banned_rights=rights
+            )
+        )
+
+        await bot_client.send_message(
+            event.chat_id,
+            "**GROUP LOCKED\n\n"
+            "Only admins can send messages. All non-admin messages will be auto-deleted.\n\n"
+            "visit - @ocyzo\n\n"
+            "Always deal with MM for extra security in deals.**",
+            parse_mode='markdown'
+        )
+
+    except Exception as e:
+        await event.respond(
+            f"❌ Lock failed: {type(e).__name__}: {e}"
+        )
+
+
+# /unlock = allow ordinary members to send messages again via BOT
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/unlock$"))
+async def unlock_group(event):
+    if not is_owner(event):
+        return
+
+    if not event.is_group:
+        await event.respond("❌ Use /unlock inside a group.")
+        return
+
+    await event.delete()
+
+    try:
+        rights = types.ChatBannedRights(
+            until_date=None,
+            send_messages=False,
+            send_media=False,
+            send_stickers=False,
+            send_gifs=False,
+            send_games=False,
+            send_inline=False,
+            embed_links=False,
+            send_polls=False,
+            change_info=False,
+            invite_users=False,
+            pin_messages=False,
+            send_photos=False,
+            send_videos=False,
+            send_roundvideos=False,
+            send_audios=False,
+            send_docs=False,
+            send_voices=False,
+            send_plain=False
+        )
+
+        await client(
+            functions.messages.EditChatDefaultBannedRightsRequest(
+                peer=await event.get_input_chat(),
+                banned_rights=rights
+            )
+        )
+
+        await bot_client.send_message(event.chat_id, "**🔓 Group unlocked.**", parse_mode='markdown')
+
+    except Exception as e:
+        await event.respond(
+            f"❌ Unlock failed: {type(e).__name__}: {e}"
+        )
+
+
+# /vouch = send vouch instruction message via BOT
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/vouch$"))
+async def vouch_command(event):
+    if not is_owner(event):
+        return
+    
+    chat_id = event.chat_id
+    await event.delete()
+    await bot_client.send_message(
+        chat_id,
+        "**✅ Please Vouch for this deal.\n\n"
+        "Official Escrow - @ocyzo\n"
+        "Vouches - @spidoc\n\n"
+        "Copy the text below 👇**\n\n"
+        "`Vouch @ocyzo 10/10 MM Deal 🤝`",
+        parse_mode='markdown'
+    )
+
+
+async def main():
+    print("Starting Telegram user account...")
+    await client.start()
+
+    print("Starting Telegram bot account...")
+    await bot_client.start(bot_token=BOT_TOKEN)
+
+    me = await client.get_me()
+    bot_me = await bot_client.get_me()
+
+    if me.bot:
+        print("ERROR: You logged in with a BOT account for the main client.")
+        print("Use your normal Telegram phone account.")
+        return
+
+    print(f"Logged in as User: {me.first_name} (ID: {me.id})")
+    print(f"Logged in as Bot: @{bot_me.username}")
+    print("Commands: /mm, /lock, /unlock, /recived, /relese, /refund, /vouch, /qr, /delete")
+    print("Running...")
+
+    # Run both the user client and bot client simultaneously
+    await asyncio.gather(
+        client.run_until_disconnected(),
+        bot_client.run_until_disconnected()
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
